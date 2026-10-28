@@ -1,0 +1,50 @@
+public final class to/holepunch/bare/stow/host/Frame {
+	public static final field CONTROL B
+	public static final field INSTANCE Lto/holepunch/bare/stow/host/Frame;
+	public static final field USER B
+	public final fun control (Ljava/lang/String;Ljava/util/Map;)[B
+	public static synthetic fun control$default (Lto/holepunch/bare/stow/host/Frame;Ljava/lang/String;Ljava/util/Map;ILjava/lang/Object;)[B
+	public final fun encode (B[B)[B
+}
+
+public final class to/holepunch/bare/stow/host/FrameDecoder {
+	public fun <init> ()V
+	public final fun feed ([B)Ljava/util/List;
+}
+
+public final class to/holepunch/bare/stow/host/IPC {
+	public static final field Companion Lto/holepunch/bare/stow/host/IPC$Companion;
+	public synthetic fun <init> (Lto/holepunch/bare/stow/host/Transport;Lkotlin/jvm/functions/Function0;Lkotlin/time/Duration;JILkotlin/jvm/internal/DefaultConstructorMarker;)V
+	public synthetic fun <init> (Lto/holepunch/bare/stow/host/Transport;Lkotlin/jvm/functions/Function0;Lkotlin/time/Duration;JLkotlin/jvm/internal/DefaultConstructorMarker;)V
+	public final fun close (Lkotlin/coroutines/Continuation;)Ljava/lang/Object;
+	public final fun exited (Ljava/lang/Integer;Ljava/lang/Integer;)V
+	public static synthetic fun exited$default (Lto/holepunch/bare/stow/host/IPC;Ljava/lang/Integer;Ljava/lang/Integer;ILjava/lang/Object;)V
+	public final fun getData ()Lkotlinx/coroutines/flow/Flow;
+	public final fun getExitCode ()Ljava/lang/Integer;
+	public final fun ready (Lkotlin/coroutines/Continuation;)Ljava/lang/Object;
+	public final fun terminate (Lkotlin/coroutines/Continuation;)Ljava/lang/Object;
+	public final fun wait (Lkotlin/coroutines/Continuation;)Ljava/lang/Object;
+	public final fun write ([BLkotlin/coroutines/Continuation;)Ljava/lang/Object;
+}
+
+public final class to/holepunch/bare/stow/host/IPC$Companion {
+	public final fun getDEFAULT_GRACE-UwyO8pc ()J
+}
+
+public final class to/holepunch/bare/stow/host/ProtocolKt {
+	public static final fun decodeControl ([B)Lkotlinx/serialization/json/JsonObject;
+}
+
+public abstract interface class to/holepunch/bare/stow/host/Transport {
+	public abstract fun getData ()Lkotlinx/coroutines/flow/Flow;
+	public abstract fun write ([BLkotlin/coroutines/Continuation;)Ljava/lang/Object;
+}
+
+public final class to/holepunch/bare/stow/host/WorkerError : java/lang/Exception {
+	public fun <init> (Ljava/lang/String;Ljava/lang/String;Ljava/lang/Integer;Ljava/lang/Integer;)V
+	public synthetic fun <init> (Ljava/lang/String;Ljava/lang/String;Ljava/lang/Integer;Ljava/lang/Integer;ILkotlin/jvm/internal/DefaultConstructorMarker;)V
+	public final fun getExitCode ()Ljava/lang/Integer;
+	public final fun getSignal ()Ljava/lang/Integer;
+	public final fun getStack ()Ljava/lang/String;
+}
+
