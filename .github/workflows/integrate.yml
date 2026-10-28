@@ -1,0 +1,40 @@
+name: Integrate
+on:
+  push:
+    branches:
+      - main
+  pull_request:
+    branches:
+      - main
+permissions:
+  contents: read
+jobs:
+  security:
+    runs-on: ubuntu-24.04
+    name: Security
+    steps:
+      - uses: holepunchto/actions/security-base@v1
+  lint:
+    runs-on: ubuntu-24.04
+    name: Lint
+    steps:
+      - uses: holepunchto/actions/java-base@v1
+      - run: ./gradlew ktfmtCheck checkKotlinAbi dokkaGenerate
+  test:
+    strategy:
+      matrix:
+        include:
+          - os: ubuntu-24.04
+            platform: linux
+            arch: x64
+          - os: macos-15
+            platform: darwin
+            arch: arm64
+          - os: windows-2025
+            platform: win32
+            arch: x64
+    runs-on: ${{ matrix.os }}
+    name: Test / ${{ matrix.platform }}-${{ matrix.arch }}
+    steps:
+      - uses: holepunchto/actions/java-base@v1
+      - run: ./gradlew jvmTest testAndroidHostTest
