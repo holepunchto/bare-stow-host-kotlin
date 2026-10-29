@@ -16,12 +16,12 @@ import kotlinx.coroutines.withTimeout
 import kotlinx.serialization.json.JsonPrimitive
 import kotlinx.serialization.json.intOrNull
 
-class IPCTest {
+class IpcTest {
   private fun test(block: suspend kotlinx.coroutines.CoroutineScope.() -> Unit) = runBlocking {
     withTimeout(10.seconds) { block() }
   }
 
-  private suspend fun assertReadyFails(ipc: IPC, message: String): WorkerError {
+  private suspend fun assertReadyFails(ipc: Ipc, message: String): WorkerError {
     val error = assertFailsWith<WorkerError> { ipc.ready() }
 
     assertEquals(message, error.message)
@@ -32,7 +32,7 @@ class IPCTest {
   @Test
   fun resolvesReadyWhenTheWorkerSignals() = test {
     val (left, right) = pair()
-    val ipc = IPC(left, kill = { left.close() })
+    val ipc = Ipc(left.data, left::write, kill = { left.close() })
     val worker = Worker(right)
 
     worker.send("ready")
@@ -45,7 +45,7 @@ class IPCTest {
   @Test
   fun sendsTheGraceToTheWorker() = test {
     val (left, right) = pair()
-    val ipc = IPC(left, kill = { left.close() }, grace = 2500.milliseconds)
+    val ipc = Ipc(left.data, left::write, kill = { left.close() }, grace = 2500.milliseconds)
     val worker = Worker(right)
 
     val message = worker.receive("configure")
@@ -59,7 +59,7 @@ class IPCTest {
   @Test
   fun failsReadyWhenTheWorkerErrorsBeforeReady() = test {
     val (left, right) = pair()
-    val ipc = IPC(left, kill = { left.close() })
+    val ipc = Ipc(left.data, left::write, kill = { left.close() })
     val worker = Worker(right)
 
     worker.sendError("boom")
@@ -73,7 +73,7 @@ class IPCTest {
   @Test
   fun failsReadyWhenTheWorkerExitsBeforeReady() = test {
     val (left, right) = pair()
-    val ipc = IPC(left, kill = { left.close() })
+    val ipc = Ipc(left.data, left::write, kill = { left.close() })
     val worker = Worker(right)
 
     worker.send("exit", mapOf("code" to 1))
@@ -87,7 +87,7 @@ class IPCTest {
   @Test
   fun failsReadyWhenTheTransportClosesBeforeReady() = test {
     val (left, _) = pair()
-    val ipc = IPC(left, kill = { left.close() })
+    val ipc = Ipc(left.data, left::write, kill = { left.close() })
 
     left.close()
 
@@ -97,7 +97,7 @@ class IPCTest {
   @Test
   fun ignoresExitAfterReady() = test {
     val (left, right) = pair()
-    val ipc = IPC(left, kill = { left.close() })
+    val ipc = Ipc(left.data, left::write, kill = { left.close() })
     val worker = Worker(right)
 
     worker.send("ready")
@@ -113,7 +113,7 @@ class IPCTest {
   @Test
   fun reportsTheExitCode() = test {
     val (left, right) = pair()
-    val ipc = IPC(left, kill = { left.close() })
+    val ipc = Ipc(left.data, left::write, kill = { left.close() })
     val worker = Worker(right)
 
     worker.send("ready")
@@ -127,7 +127,7 @@ class IPCTest {
   @Test
   fun carriesUserData() = test {
     val (left, right) = pair()
-    val ipc = IPC(left, kill = { left.close() })
+    val ipc = Ipc(left.data, left::write, kill = { left.close() })
     val worker = Worker(right)
 
     worker.write("payload".encodeToByteArray())
@@ -150,7 +150,7 @@ class IPCTest {
   @Test
   fun terminateReturnsTheExitCode() = test {
     val (left, right) = pair()
-    val ipc = IPC(left, kill = { left.close() })
+    val ipc = Ipc(left.data, left::write, kill = { left.close() })
     val worker = Worker(right)
 
     worker.send("ready")
@@ -172,7 +172,7 @@ class IPCTest {
   @Test
   fun closeSendsTerminateToTheWorker() = test {
     val (left, right) = pair()
-    val ipc = IPC(left, kill = { left.close() })
+    val ipc = Ipc(left.data, left::write, kill = { left.close() })
     val worker = Worker(right)
 
     val closing = async {
@@ -187,7 +187,7 @@ class IPCTest {
   @Test
   fun waitReturnsWhenTheTransportCloses() = test {
     val (left, _) = pair()
-    val ipc = IPC(left, kill = { left.close() })
+    val ipc = Ipc(left.data, left::write, kill = { left.close() })
 
     left.close()
 
@@ -197,7 +197,7 @@ class IPCTest {
   @Test
   fun failsReadyAndTerminatesTheWorkerOnTimeout() = test {
     val (left, right) = pair()
-    val ipc = IPC(left, kill = { left.close() }, timeout = 10.milliseconds)
+    val ipc = Ipc(left.data, left::write, kill = { left.close() }, timeout = 10.milliseconds)
     val worker = Worker(right)
 
     assertReadyFails(ipc, "Worker timed out before ready")
@@ -209,7 +209,7 @@ class IPCTest {
   @Test
   fun terminateKillsTheWorkerAfterTheGracePeriod() = test {
     val (left, right) = pair()
-    val ipc = IPC(left, kill = { left.close() }, grace = 10.milliseconds)
+    val ipc = Ipc(left.data, left::write, kill = { left.close() }, grace = 10.milliseconds)
     val worker = Worker(right)
 
     worker.send("ready")
@@ -222,7 +222,7 @@ class IPCTest {
   @Test
   fun closeKillsTheWorkerAfterTheGracePeriod() = test {
     val (left, _) = pair()
-    val ipc = IPC(left, kill = { left.close() }, grace = 10.milliseconds)
+    val ipc = Ipc(left.data, left::write, kill = { left.close() }, grace = 10.milliseconds)
 
     ipc.close()
 
@@ -232,7 +232,7 @@ class IPCTest {
   @Test
   fun terminateReturnsOnceTheTransportHasClosed() = test {
     val (left, _) = pair()
-    val ipc = IPC(left, kill = { left.close() })
+    val ipc = Ipc(left.data, left::write, kill = { left.close() })
 
     left.close()
 
@@ -244,7 +244,7 @@ class IPCTest {
   @Test
   fun exitedBeforeReadyFailsReadyWithTheExitCode() = test {
     val (left, _) = pair()
-    val ipc = IPC(left, kill = { left.close() }, grace = 10.milliseconds)
+    val ipc = Ipc(left.data, left::write, kill = { left.close() }, grace = 10.milliseconds)
 
     ipc.exited(3)
 
@@ -258,7 +258,7 @@ class IPCTest {
   @Test
   fun exitedAfterReadyFailsWithTheSignal() = test {
     val (left, right) = pair()
-    val ipc = IPC(left, kill = { left.close() }, grace = 10.milliseconds)
+    val ipc = Ipc(left.data, left::write, kill = { left.close() }, grace = 10.milliseconds)
     val worker = Worker(right)
 
     worker.send("ready")
@@ -277,7 +277,7 @@ class IPCTest {
   @Test
   fun exitedIsIgnoredAfterAnExitFrame() = test {
     val (left, right) = pair()
-    val ipc = IPC(left, kill = { left.close() })
+    val ipc = Ipc(left.data, left::write, kill = { left.close() })
     val worker = Worker(right)
 
     worker.send("ready")
@@ -295,7 +295,7 @@ class IPCTest {
   @Test
   fun exitedIsIgnoredWhileTerminating() = test {
     val (left, right) = pair()
-    val ipc = IPC(left, kill = { left.close() }, grace = 10.milliseconds)
+    val ipc = Ipc(left.data, left::write, kill = { left.close() }, grace = 10.milliseconds)
     val worker = Worker(right)
 
     worker.send("ready")

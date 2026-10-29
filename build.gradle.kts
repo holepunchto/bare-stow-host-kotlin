@@ -47,4 +47,16 @@ ktfmt { googleStyle() }
 
 tasks.named<Test>("jvmTest") { useJUnitPlatform() }
 
-tasks.check { dependsOn("dokkaGenerate") }
+tasks.register("lint") {
+  group = "verification"
+  description = "Checks the formatting, the ABI, and the documentation."
+  dependsOn("ktfmtCheck", "checkKotlinAbi", "dokkaGenerate")
+}
+
+tasks.register("test") {
+  group = "verification"
+  description = "Runs the tests on every target."
+  dependsOn("jvmTest", "testAndroidHostTest")
+}
+
+tasks.check { dependsOn("lint") }
