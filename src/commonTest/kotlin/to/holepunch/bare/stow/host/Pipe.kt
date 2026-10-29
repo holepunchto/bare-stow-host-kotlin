@@ -11,7 +11,7 @@ import kotlinx.serialization.json.JsonObject
 import kotlinx.serialization.json.JsonPrimitive
 import kotlinx.serialization.json.contentOrNull
 
-class End : Transport {
+class End {
   private val received = Channel<ByteArray>(Channel.UNLIMITED)
 
   lateinit var peer: End
@@ -20,9 +20,9 @@ class End : Transport {
   var closed = false
     private set
 
-  override val data: Flow<ByteArray> = received.consumeAsFlow()
+  val data: Flow<ByteArray> = received.consumeAsFlow()
 
-  override suspend fun write(data: ByteArray) {
+  suspend fun write(data: ByteArray) {
     if (closed) throw IOException("Broken pipe")
 
     peer.received.trySend(data)

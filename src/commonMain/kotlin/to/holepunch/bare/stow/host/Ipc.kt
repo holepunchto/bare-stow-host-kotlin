@@ -20,15 +20,6 @@ import kotlinx.serialization.json.JsonPrimitive
 import kotlinx.serialization.json.contentOrNull
 import kotlinx.serialization.json.intOrNull
 
-/** A byte transport to a stowed bundle, such as the IPC of a worklet from `bare-kit-kotlin`. */
-public interface Transport {
-  /** The data written by the bundle, until the transport ends. */
-  public val data: Flow<ByteArray>
-
-  /** Writes [data] to the bundle. */
-  public suspend fun write(data: ByteArray)
-}
-
 /** A fault reported by or observed in the worker. */
 public class WorkerError(
   message: String,
@@ -41,20 +32,19 @@ public class WorkerError(
 ) : Exception(message)
 
 /**
- * The host side of a stowed bundle, layering readiness, termination, and exit reporting over a
- * transport.
+ * The host side of a stowed bundle, layering readiness, termination, and exit reporting over a byte
+ * transport to it, such as the IPC of a worklet from `bare-kit-kotlin`.
  *
- * [data] yields the user data written by the worker until the transport ends, and throws a
- * [WorkerError] once the worker has reported a fault or exited without saying why.
- *
- * @param transport The transport to the bundle.
+ * @param data The data written by the bundle, until the transport ends.
+ * @param write Writes data to the bundle.
  * @param kill Stops a worker that ignores `terminate` for [grace].
  * @param timeout How long to wait for the worker to signal ready before failing [ready] and
  *   terminating it, or `null` to wait indefinitely.
  * @param grace How long a terminating worker gets to stop and exit before [kill] is called.
  */
-public class IPC(
-  transport: Transport,
+public class Ipc(
+  data: Flow<ByteArray>,
+  write: suspend (ByteArray) -> Unit,
   private val kill: () -> Unit,
   timeout: Duration? = null,
   private val grace: Duration = DEFAULT_GRACE,
@@ -74,14 +64,17 @@ public class IPC(
 
   private val reading: Job
 
-  /** The user data written by the worker. It can be collected only once. */
+  /**
+   * The user data written by the worker until the transport ends. It throws a [WorkerError] once
+   * the worker has reported a fault or exited without saying why, and can be collected only once.
+   */
   public val data: Flow<ByteArray> = received.consumeAsFlow()
 
   init {
     scope.launch {
       for ((frame, written) in writes) {
         try {
-          transport.write(frame)
+          write(frame)
 
           written?.complete(Unit)
         } catch (error: Exception) {
@@ -94,7 +87,7 @@ public class IPC(
       Frame.control("configure", mapOf("grace" to grace.inWholeMilliseconds.toInt())) to null
     )
 
-    reading = scope.launch { readFrames(transport) }
+    reading = scope.launch { readFrames(data) }
 
     if (timeout != null) {
       val timer = scope.launch {
@@ -176,13 +169,11 @@ public class IPC(
     }
   }
 
-  private suspend fun readFrames(transport: Transport) {
+  private suspend fun readFrames(data: Flow<ByteArray>) {
     val decoder = FrameDecoder()
 
     try {
-      transport.data.collect { chunk ->
-        for ((tag, payload) in decoder.feed(chunk)) onFrame(tag, payload)
-      }
+      data.collect { chunk -> for ((tag, payload) in decoder.feed(chunk)) onFrame(tag, payload) }
     } catch (error: CancellationException) {
       throw error
     } catch (error: Exception) {
@@ -275,7 +266,7 @@ public class IPC(
 
   private fun JsonObject.string(key: String): String? = (this[key] as? JsonPrimitive)?.contentOrNull
 
-  /** Defaults of an [IPC]. */
+  /** Defaults of an [Ipc]. */
   public companion object {
     /** The default time a terminating worker gets to stop and exit. */
     public val DEFAULT_GRACE: Duration = 5.seconds
