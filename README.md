@@ -36,6 +36,8 @@ val code = ipc.terminate()
 
 Any transport with a `Flow` of `ByteArray` to read and a suspending function to write can be used, such as the IPC of a worklet from [bare-kit-kotlin](https://github.com/holepunchto/bare-kit-kotlin).
 
+Whoever creates the `Ipc` must report the exit of the worker with `exited()`, as above. A transport that ends or fails without the worker saying why is held until then, so that `ready()`, `data` and `wait()` fail with the exit code or signal rather than ending as if the worker had stopped cleanly. A worker whose transport fails and that does not exit within the grace period is killed.
+
 ## Protocol
 
 Every frame is a 4-byte little-endian length followed by that many bytes: A 1-byte tag and the payload. The tag is `0x00` for a control frame, whose payload is a UTF-8 JSON object carrying its `type`, and `0x01` for a user data frame. See [bare-stow-protocol](https://github.com/holepunchto/bare-stow-protocol) for the control frames.
