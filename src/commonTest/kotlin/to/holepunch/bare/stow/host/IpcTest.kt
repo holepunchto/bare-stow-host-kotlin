@@ -1,18 +1,27 @@
 package to.holepunch.bare.stow.host
 
+import java.io.IOException
 import kotlin.test.Test
 import kotlin.test.assertContentEquals
 import kotlin.test.assertEquals
 import kotlin.test.assertFailsWith
+import kotlin.test.assertFalse
 import kotlin.test.assertNull
+import kotlin.test.assertSame
 import kotlin.test.assertTrue
 import kotlin.time.Duration.Companion.milliseconds
 import kotlin.time.Duration.Companion.seconds
+import kotlinx.coroutines.CompletableDeferred
+import kotlinx.coroutines.CoroutineStart
 import kotlinx.coroutines.async
+import kotlinx.coroutines.delay
 import kotlinx.coroutines.flow.collect
+import kotlinx.coroutines.flow.flow
+import kotlinx.coroutines.flow.onCompletion
 import kotlinx.coroutines.flow.produceIn
 import kotlinx.coroutines.runBlocking
 import kotlinx.coroutines.withTimeout
+import kotlinx.coroutines.withTimeoutOrNull
 import kotlinx.serialization.json.JsonPrimitive
 import kotlinx.serialization.json.intOrNull
 
@@ -21,10 +30,10 @@ class IpcTest {
     withTimeout(10.seconds) { block() }
   }
 
-  private suspend fun assertReadyFails(ipc: Ipc, message: String): WorkerError {
+  private suspend fun assertReadyFails(ipc: Ipc, code: String): WorkerError {
     val error = assertFailsWith<WorkerError> { ipc.ready() }
 
-    assertEquals(message, error.message)
+    assertEquals(code, error.code)
 
     return error
   }
@@ -38,6 +47,7 @@ class IpcTest {
     worker.send("ready")
     ipc.ready()
 
+    worker.send("exit", mapOf("code" to 0))
     worker.close()
     ipc.wait()
   }
@@ -52,6 +62,7 @@ class IpcTest {
 
     assertEquals(2500, (message?.get("grace") as? JsonPrimitive)?.intOrNull)
 
+    worker.send("exit", mapOf("code" to 0))
     worker.close()
     ipc.wait()
   }
@@ -64,7 +75,7 @@ class IpcTest {
 
     worker.sendError("boom")
 
-    assertReadyFails(ipc, "boom")
+    assertEquals("boom", assertReadyFails(ipc, "WORKER_ERROR").message)
 
     worker.receive("terminate")
     worker.close()
@@ -78,20 +89,28 @@ class IpcTest {
 
     worker.send("exit", mapOf("code" to 1))
 
-    assertReadyFails(ipc, "Worker exited with code 1 before ready")
+    val error = assertReadyFails(ipc, "WORKER_EXITED")
+
+    assertEquals(1, error.exitCode)
 
     worker.receive("terminate")
     worker.close()
   }
 
   @Test
-  fun failsReadyWhenTheTransportClosesBeforeReady() = test {
-    val (left, _) = pair()
+  fun failsReadyWhenTheTransportClosesBeforeReadyWhileTerminating() = test {
+    val (left, right) = pair()
     val ipc = Ipc(left.data, left::write, kill = { left.close() })
+    val worker = Worker(right)
 
-    left.close()
+    val closing = async { ipc.close() }
 
-    assertReadyFails(ipc, "Worker closed before ready")
+    worker.receive("terminate")
+    worker.close()
+
+    assertReadyFails(ipc, "WORKER_CLOSED")
+
+    closing.await()
   }
 
   @Test
@@ -140,11 +159,16 @@ class IpcTest {
 
     val replied = worker.data()
 
+    worker.send("exit", mapOf("code" to 0))
     worker.close()
 
     assertContentEquals("payload".encodeToByteArray(), payload)
     assertContentEquals("reply".encodeToByteArray(), replied)
-    assertTrue(received.receiveCatching().isClosed)
+
+    val end = received.receiveCatching()
+
+    assertTrue(end.isClosed)
+    assertNull(end.exceptionOrNull())
   }
 
   @Test
@@ -185,13 +209,99 @@ class IpcTest {
   }
 
   @Test
-  fun waitReturnsWhenTheTransportCloses() = test {
+  fun waitReturnsOnceTheExitOfAClosedTransportIsReported() = test {
     val (left, _) = pair()
     val ipc = Ipc(left.data, left::write, kill = { left.close() })
 
     left.close()
+    ipc.exited(0)
 
     assertNull(ipc.wait())
+
+    val error = assertFailsWith<WorkerError> { ipc.write("late".encodeToByteArray()) }
+
+    assertEquals("WORKER_CLOSED", error.code)
+  }
+
+  @Test
+  fun failsReadyWhenTheTransportFails() = test {
+    val failure = IOException("Input/output error")
+    val ipc = Ipc(flow { throw failure }, {}, kill = {}, grace = 10.milliseconds)
+
+    val error = assertReadyFails(ipc, "TRANSPORT_ERROR")
+
+    assertEquals("Input/output error", error.message)
+    assertSame(failure, error.cause)
+  }
+
+  @Test
+  fun failsACrashedWorkerWithItsExitRatherThanATransportFailure() = test {
+    val failure = IOException("Input/output error")
+    val failed = CompletableDeferred<Unit>()
+    val ipc =
+      Ipc(
+        flow {
+          failed.complete(Unit)
+          throw failure
+        },
+        {},
+        kill = {},
+      )
+
+    failed.await()
+
+    assertNull(withTimeoutOrNull(50.milliseconds) { ipc.wait() })
+
+    ipc.exited(null, signal = 11)
+
+    val error = assertReadyFails(ipc, "WORKER_KILLED")
+    val cause = error.cause as WorkerError
+
+    assertEquals("TRANSPORT_ERROR", cause.code)
+    assertSame(failure, cause.cause)
+  }
+
+  @Test
+  fun killsAWorkerWhoseTransportFailsAndThatDoesNotExit() = test {
+    val failure = IOException("Input/output error")
+    val killed = CompletableDeferred<Unit>()
+    val ipc =
+      Ipc(
+        flow { throw failure },
+        {},
+        kill = { killed.complete(Unit) },
+        grace = 10.milliseconds,
+      )
+
+    val error = assertReadyFails(ipc, "TRANSPORT_ERROR")
+
+    assertEquals("Input/output error", error.message)
+    assertSame(failure, error.cause)
+    assertTrue(killed.isCompleted)
+  }
+
+  @Test
+  fun treatsAResetTransportAsClosed() = test {
+    val ended = CompletableDeferred<Unit>()
+    val ipc =
+      Ipc(
+        flow {
+          ended.complete(Unit)
+          throw IOException("Connection reset by peer")
+        },
+        {},
+        kill = {},
+      )
+
+    ended.await()
+
+    assertNull(withTimeoutOrNull(50.milliseconds) { ipc.wait() })
+
+    ipc.exited(1)
+
+    val error = assertReadyFails(ipc, "WORKER_EXITED")
+
+    assertNull(error.cause)
   }
 
   @Test
@@ -200,7 +310,7 @@ class IpcTest {
     val ipc = Ipc(left.data, left::write, kill = { left.close() }, timeout = 10.milliseconds)
     val worker = Worker(right)
 
-    assertReadyFails(ipc, "Worker timed out before ready")
+    assertReadyFails(ipc, "WORKER_TIMEOUT")
 
     worker.receive("terminate")
     worker.close()
@@ -235,8 +345,9 @@ class IpcTest {
     val ipc = Ipc(left.data, left::write, kill = { left.close() })
 
     left.close()
+    ipc.exited(1)
 
-    assertReadyFails(ipc, "Worker closed before ready")
+    assertReadyFails(ipc, "WORKER_EXITED")
 
     assertNull(ipc.terminate())
   }
@@ -248,11 +359,93 @@ class IpcTest {
 
     ipc.exited(3)
 
-    val error = assertReadyFails(ipc, "Worker exited with code 3")
+    val error = assertReadyFails(ipc, "WORKER_EXITED")
 
     assertEquals(3, error.exitCode)
 
     ipc.close()
+  }
+
+  @Test
+  fun exitedWithACodeAndASignalCarriesBoth() = test {
+    val (left, _) = pair()
+    val ipc = Ipc(left.data, left::write, kill = { left.close() }, grace = 10.milliseconds)
+
+    ipc.exited(137, signal = 9)
+
+    val error = assertReadyFails(ipc, "WORKER_KILLED")
+
+    assertEquals(137, error.exitCode)
+    assertEquals(9, error.signal)
+
+    ipc.close()
+  }
+
+  @Test
+  fun failsAWriteWhenTheTransportFails() = test {
+    val (left, _) = pair()
+    val failure = IOException("Input/output error")
+    val ipc = Ipc(left.data, { throw failure }, kill = { left.close() }, grace = 10.milliseconds)
+
+    val error = assertFailsWith<WorkerError> { ipc.write("payload".encodeToByteArray()) }
+
+    assertEquals("Input/output error", error.message)
+    assertEquals("TRANSPORT_ERROR", error.code)
+    assertSame(failure, error.cause)
+
+    left.close()
+    ipc.wait()
+  }
+
+  @Test
+  fun failsAWriteToAWorkerThatWentAwayAsClosed() = test {
+    val (left, _) = pair()
+    val ipc = Ipc(left.data, { throw IOException("Broken pipe") }, kill = { left.close() })
+
+    val error = assertFailsWith<WorkerError> { ipc.write("payload".encodeToByteArray()) }
+
+    assertEquals("WORKER_CLOSED", error.code)
+
+    left.close()
+    ipc.exited(0)
+
+    assertReadyFails(ipc, "WORKER_EXITED")
+  }
+
+  @Test
+  fun ignoresATransportFailureAfterAnExitFrame() = test {
+    val (left, right) = pair()
+    var broken = false
+    val ipc =
+      Ipc(
+        left.data,
+        {
+          if (broken) throw IOException("Input/output error")
+          left.write(it)
+        },
+        kill = { left.close() },
+      )
+    val worker = Worker(right)
+    val received = ipc.data.produceIn(this)
+
+    worker.send("ready")
+    worker.send("exit", mapOf("code" to 0))
+    worker.write("payload".encodeToByteArray())
+
+    received.receive()
+
+    broken = true
+
+    val error = assertFailsWith<WorkerError> { ipc.write("reply".encodeToByteArray()) }
+
+    assertEquals("WORKER_CLOSED", error.code)
+
+    worker.close()
+
+    val end = received.receiveCatching()
+
+    assertTrue(end.isClosed)
+    assertNull(end.exceptionOrNull())
   }
 
   @Test
@@ -268,7 +461,7 @@ class IpcTest {
 
     val error = assertFailsWith<WorkerError> { ipc.data.collect() }
 
-    assertEquals("Worker was killed by signal 9", error.message)
+    assertEquals("WORKER_KILLED", error.code)
     assertEquals(9, error.signal)
 
     ipc.close()
@@ -310,5 +503,140 @@ class IpcTest {
     assertNull(terminated.await())
 
     ipc.data.collect()
+  }
+
+  @Test
+  fun holdsTheEndOfAWorkerThatCrashesAfterReady() = test {
+    val (left, right) = pair()
+    val ended = CompletableDeferred<Unit>()
+    val ipc =
+      Ipc(
+        left.data.onCompletion { ended.complete(Unit) },
+        left::write,
+        kill = { left.close() },
+      )
+    val worker = Worker(right)
+
+    worker.send("ready")
+    ipc.ready()
+
+    val reading = async { assertFailsWith<WorkerError> { ipc.data.collect() } }
+
+    worker.close()
+    ended.await()
+
+    assertNull(withTimeoutOrNull(50.milliseconds) { ipc.wait() })
+
+    ipc.exited(null, signal = 11)
+
+    val error = reading.await()
+
+    assertEquals("WORKER_KILLED", error.code)
+    assertEquals(11, error.signal)
+
+    ipc.wait()
+  }
+
+  @Test
+  fun holdsTheEndOfAWorkerThatCrashesBeforeReady() = test {
+    val (left, right) = pair()
+    val ended = CompletableDeferred<Unit>()
+    val ipc =
+      Ipc(
+        left.data.onCompletion { ended.complete(Unit) },
+        left::write,
+        kill = { left.close() },
+      )
+    val worker = Worker(right)
+
+    worker.close()
+    ended.await()
+
+    assertNull(withTimeoutOrNull(50.milliseconds) { ipc.wait() })
+
+    ipc.exited(1)
+
+    val error = assertReadyFails(ipc, "WORKER_EXITED")
+
+    assertEquals(1, error.exitCode)
+
+    ipc.close()
+  }
+
+  @Test
+  fun failsACrashedWorkerWithItsExitRatherThanATimeout() = test {
+    val (left, right) = pair()
+    val ipc =
+      Ipc(
+        left.data,
+        left::write,
+        kill = { left.close() },
+        timeout = 50.milliseconds,
+      )
+    val worker = Worker(right)
+
+    worker.close()
+
+    delay(100.milliseconds)
+
+    ipc.exited(1)
+
+    val error = assertReadyFails(ipc, "WORKER_EXITED")
+
+    assertEquals(1, error.exitCode)
+  }
+
+  @Test
+  fun exitedAppliesToACloseAfterTheTransportEnded() = test {
+    val (left, right) = pair()
+    val ended = CompletableDeferred<Unit>()
+    var killed = false
+    val ipc =
+      Ipc(
+        left.data.onCompletion { ended.complete(Unit) },
+        left::write,
+        kill = { killed = true },
+        grace = 10.milliseconds,
+      )
+    val worker = Worker(right)
+
+    worker.send("ready")
+    ipc.ready()
+
+    worker.close()
+    ended.await()
+
+    assertNull(withTimeoutOrNull(50.milliseconds) { ipc.wait() })
+
+    val closing = async(start = CoroutineStart.UNDISPATCHED) { ipc.close() }
+
+    delay(50.milliseconds)
+
+    ipc.exited(null, signal = 9)
+
+    val error = assertFailsWith<WorkerError> { ipc.data.collect() }
+
+    assertEquals("WORKER_KILLED", error.code)
+
+    closing.await()
+
+    assertFalse(killed)
+  }
+
+  @Test
+  fun endsAWorkerThatExitsOnItsOwnWithoutHolding() = test {
+    val (left, right) = pair()
+    val ipc = Ipc(left.data, left::write, kill = { left.close() })
+    val worker = Worker(right)
+
+    worker.send("ready")
+    ipc.ready()
+
+    worker.send("exit", mapOf("code" to 0))
+    worker.close()
+
+    ipc.data.collect()
+
+    assertEquals(0, ipc.wait())
   }
 }

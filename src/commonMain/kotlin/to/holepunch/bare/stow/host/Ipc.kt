@@ -1,5 +1,6 @@
 package to.holepunch.bare.stow.host
 
+import java.io.IOException
 import kotlin.time.Duration
 import kotlin.time.Duration.Companion.seconds
 import kotlinx.coroutines.CancellationException
@@ -21,15 +22,49 @@ import kotlinx.serialization.json.contentOrNull
 import kotlinx.serialization.json.intOrNull
 
 /** A fault reported by or observed in the worker. */
-public class WorkerError(
-  message: String,
+public class WorkerError : Exception {
+  /**
+   * What went wrong: `WORKER_ERROR` for a fault the worker reported, `WORKER_EXITED` with
+   * [exitCode] for a worker that exited, `WORKER_KILLED` with [signal] for a worker killed by a
+   * signal, `WORKER_CLOSED` for a transport that closed before ready or a write after close,
+   * `WORKER_TIMEOUT` for a worker that timed out before ready, and `TRANSPORT_ERROR` with [cause]
+   * for a transport that failed while reading or writing. A transport that is reset or broken by
+   * the worker going away counts as closing rather than failing.
+   */
+  public val code: String
+
   /** The stack of the error reported by the worker, if any. */
-  public val stack: String? = null,
-  /** The exit code of a worker that exited without saying why. */
-  public val exitCode: Int? = null,
+  public val stack: String?
+
+  /** The exit code of a worker that exited, if known. */
+  public val exitCode: Int?
+
   /** The signal that killed a worker that exited without saying why. */
-  public val signal: Int? = null,
-) : Exception(message)
+  public val signal: Int?
+
+  /** Creates a `WORKER_ERROR` error. */
+  public constructor(
+    message: String,
+    stack: String? = null,
+    exitCode: Int? = null,
+    signal: Int? = null,
+  ) : this(message, stack, exitCode, signal, "WORKER_ERROR")
+
+  /** Creates an error of [code], caused by [cause] if any. */
+  public constructor(
+    message: String,
+    stack: String? = null,
+    exitCode: Int? = null,
+    signal: Int? = null,
+    code: String = "WORKER_ERROR",
+    cause: Throwable? = null,
+  ) : super(message, cause) {
+    this.code = code
+    this.stack = stack
+    this.exitCode = exitCode
+    this.signal = signal
+  }
+}
 
 /**
  * The host side of a stowed bundle, layering readiness, termination, and exit reporting over a byte
@@ -41,6 +76,12 @@ public class WorkerError(
  * @param timeout How long to wait for the worker to signal ready before failing [ready] and
  *   terminating it, or `null` to wait indefinitely.
  * @param grace How long a terminating worker gets to stop and exit before [kill] is called.
+ *
+ * The creator of the handle must report the exit of the worker with [exited]. The end of a
+ * transport that ends without the worker saying why is held back until then, so that [data],
+ * [ready], [wait], and [close] fail or return with the reason. A transport that fails instead waits
+ * for the exit for [grace], failing with the exit and the failure as its cause, or calling [kill]
+ * and failing with `TRANSPORT_ERROR` if the worker hasn't exited by then.
  */
 public class Ipc(
   data: Flow<ByteArray>,
@@ -53,6 +94,7 @@ public class Ipc(
   private val received = Channel<ByteArray>(Channel.UNLIMITED)
   private val writes = Channel<Pair<ByteArray, CompletableDeferred<Unit>?>>(Channel.UNLIMITED)
   private val readied = CompletableDeferred<Unit>()
+  private val failed = CompletableDeferred<Unit>()
 
   private val lock = Any()
   private var closed = false
@@ -60,6 +102,9 @@ public class Ipc(
   private var exitReported = false
   private var failure: WorkerError? = null
   private var terminating: Deferred<Unit>? = null
+  private var terminateSent = false
+  private var transportFailure: WorkerError? = null
+  private var failing: Job? = null
   private var timer: Job? = null
 
   private val reading: Job
@@ -77,8 +122,10 @@ public class Ipc(
           write(frame)
 
           written?.complete(Unit)
-        } catch (error: Exception) {
+        } catch (error: CancellationException) {
           written?.completeExceptionally(error)
+        } catch (error: Exception) {
+          written?.completeExceptionally(transportFailed(error))
         }
       }
     }
@@ -93,7 +140,7 @@ public class Ipc(
       val timer = scope.launch {
         delay(timeout)
 
-        settleReady(WorkerError("Worker timed out before ready"))
+        settleReady(WorkerError("Worker timed out before ready", code = "WORKER_TIMEOUT"))
       }
 
       synchronized(lock) { this.timer = timer }
@@ -117,7 +164,7 @@ public class Ipc(
     val written = CompletableDeferred<Unit>()
 
     if (writes.trySend(Frame.encode(Frame.USER, data) to written).isFailure) {
-      throw WorkerError("Worker closed")
+      throw WorkerError("Worker closed", code = "WORKER_CLOSED")
     }
 
     written.await()
@@ -155,17 +202,37 @@ public class Ipc(
    * worklet.
    *
    * If the worker exited without saying why and was not asked to, the handle fails with a
-   * [WorkerError] carrying [code] and [signal].
+   * `WORKER_EXITED` or `WORKER_KILLED` [WorkerError] carrying [code] and [signal].
    */
   public fun exited(code: Int?, signal: Int? = null) {
-    val ignored = synchronized(lock) { exitReported || terminating != null || failure != null }
+    val cause =
+      synchronized(lock) {
+        if (exitReported || terminateSent || failure != null) return
 
-    if (ignored) return
+        failing?.cancel()
+
+        transportFailure
+      }
 
     if (signal != null) {
-      fail(WorkerError("Worker was killed by signal $signal", signal = signal))
+      fail(
+        WorkerError(
+          "Worker was killed by signal $signal",
+          code = "WORKER_KILLED",
+          exitCode = code,
+          signal = signal,
+          cause = cause,
+        )
+      )
     } else {
-      fail(WorkerError("Worker exited with code ${code ?: -1}", exitCode = code))
+      fail(
+        WorkerError(
+          "Worker exited with code ${code ?: -1}",
+          code = "WORKER_EXITED",
+          exitCode = code,
+          cause = cause,
+        )
+      )
     }
   }
 
@@ -177,7 +244,18 @@ public class Ipc(
     } catch (error: CancellationException) {
       throw error
     } catch (error: Exception) {
-      fail(WorkerError(error.message ?: error.toString()))
+      transportFailed(error)
+    }
+
+    // A worker whose transport ends without it saying why has crashed, so the end is held back
+    // until its exit is reported for readers to fail with. It can no longer time out, as it
+    // already ended.
+    synchronized(lock) { closed = true }
+
+    if (crashed()) {
+      synchronized(lock) { timer }?.cancel()
+
+      failed.await()
     }
 
     onClose()
@@ -204,16 +282,32 @@ public class Ipc(
           }
 
         // An error frame precedes the exit frame of a worker that faulted.
-        if (!faulted) settleReady(WorkerError("Worker exited with code ${code ?: -1} before ready"))
+        if (!faulted) {
+          settleReady(
+            WorkerError(
+              "Worker exited with code ${code ?: -1} before ready",
+              code = "WORKER_EXITED",
+              exitCode = code,
+            )
+          )
+        }
       }
-      "error" -> fail(WorkerError(message.string("message") ?: "", stack = message.string("stack")))
+      "error" ->
+        fail(
+          WorkerError(
+            message.string("message") ?: "",
+            code = "WORKER_ERROR",
+            stack = message.string("stack"),
+          )
+        )
     }
   }
 
-  private fun onClose() {
-    synchronized(lock) { closed = true }
+  private fun crashed(): Boolean =
+    synchronized(lock) { !exitReported && !terminateSent && failure == null }
 
-    settleReady(WorkerError("Worker closed before ready"))
+  private fun onClose() {
+    settleReady(WorkerError("Worker closed before ready", code = "WORKER_CLOSED"))
 
     received.close()
     writes.close()
@@ -233,6 +327,8 @@ public class Ipc(
 
     received.close(error)
 
+    failed.complete(Unit)
+
     scope.launch { close() }
   }
 
@@ -249,7 +345,14 @@ public class Ipc(
   }
 
   private suspend fun runTerminate() {
-    if (synchronized(lock) { closed }) return
+    val open =
+      synchronized(lock) {
+        if (!closed) terminateSent = true
+
+        !closed
+      }
+
+    if (!open) return reading.join()
 
     val killing = scope.launch {
       delay(grace)
@@ -262,6 +365,46 @@ public class Ipc(
     reading.join()
 
     killing.cancel()
+  }
+
+  // Returns the error to give the writer whose write failed. A transport that fails while the
+  // worker may have crashed waits for its exit as an end does, killing it if it hasn't exited
+  // within the grace period.
+  private fun transportFailed(error: Exception): WorkerError {
+    if (peerGone(error)) return WorkerError("Worker closed", code = "WORKER_CLOSED")
+
+    val failure =
+      WorkerError(error.message ?: error.toString(), code = "TRANSPORT_ERROR", cause = error)
+
+    synchronized(lock) {
+      if (closed || exitReported || terminateSent) {
+        return WorkerError("Worker closed", code = "WORKER_CLOSED")
+      }
+
+      if (this.failure != null || transportFailure != null) return failure
+
+      transportFailure = failure
+
+      timer?.cancel()
+
+      failing = scope.launch {
+        delay(grace)
+
+        kill()
+
+        fail(failure)
+      }
+    }
+
+    return failure
+  }
+
+  // A worker that goes away breaks or resets its transport rather than ending it, which is no
+  // different from it closing.
+  private fun peerGone(error: Exception): Boolean {
+    val message = (error as? IOException)?.message ?: return false
+
+    return "Broken pipe" in message || "Connection reset" in message
   }
 
   private fun JsonObject.string(key: String): String? = (this[key] as? JsonPrimitive)?.contentOrNull
