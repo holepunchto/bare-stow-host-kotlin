@@ -1,6 +1,5 @@
 package to.holepunch.bare.stow.host
 
-import java.io.IOException
 import kotlin.time.Duration
 import kotlin.time.Duration.Companion.seconds
 import kotlinx.coroutines.CancellationException
@@ -28,8 +27,8 @@ public class WorkerError : Exception {
    * [exitCode] for a worker that exited, `WORKER_KILLED` with [signal] for a worker killed by a
    * signal, `WORKER_CLOSED` for a transport that closed before ready or a write after close,
    * `WORKER_TIMEOUT` for a worker that timed out before ready, and `TRANSPORT_ERROR` with [cause]
-   * for a transport that failed while reading or writing. A transport that is reset or broken by
-   * the worker going away counts as closing rather than failing.
+   * for a transport that failed while reading or writing. A worker that exits within the grace
+   * period of a transport failure fails with its exit instead.
    */
   public val code: String
 
@@ -371,8 +370,6 @@ public class Ipc(
   // worker may have crashed waits for its exit as an end does, killing it if it hasn't exited
   // within the grace period.
   private fun transportFailed(error: Exception): WorkerError {
-    if (peerGone(error)) return WorkerError("Worker closed", code = "WORKER_CLOSED")
-
     val failure =
       WorkerError(error.message ?: error.toString(), code = "TRANSPORT_ERROR", cause = error)
 
@@ -397,14 +394,6 @@ public class Ipc(
     }
 
     return failure
-  }
-
-  // A worker that goes away breaks or resets its transport rather than ending it, which is no
-  // different from it closing.
-  private fun peerGone(error: Exception): Boolean {
-    val message = (error as? IOException)?.message ?: return false
-
-    return "Broken pipe" in message || "Connection reset" in message
   }
 
   private fun JsonObject.string(key: String): String? = (this[key] as? JsonPrimitive)?.contentOrNull
