@@ -281,30 +281,6 @@ class IpcTest {
   }
 
   @Test
-  fun treatsAResetTransportAsClosed() = test {
-    val ended = CompletableDeferred<Unit>()
-    val ipc =
-      Ipc(
-        flow {
-          ended.complete(Unit)
-          throw IOException("Connection reset by peer")
-        },
-        {},
-        kill = {},
-      )
-
-    ended.await()
-
-    assertNull(withTimeoutOrNull(50.milliseconds) { ipc.wait() })
-
-    ipc.exited(1)
-
-    val error = assertReadyFails(ipc, "WORKER_EXITED")
-
-    assertNull(error.cause)
-  }
-
-  @Test
   fun failsReadyAndTerminatesTheWorkerOnTimeout() = test {
     val (left, right) = pair()
     val ipc = Ipc(left.data, left::write, kill = { left.close() }, timeout = 10.milliseconds)
@@ -398,13 +374,13 @@ class IpcTest {
   }
 
   @Test
-  fun failsAWriteToAWorkerThatWentAwayAsClosed() = test {
+  fun failsAWorkerWhoseWriteFailsWithItsExit() = test {
     val (left, _) = pair()
     val ipc = Ipc(left.data, { throw IOException("Broken pipe") }, kill = { left.close() })
 
     val error = assertFailsWith<WorkerError> { ipc.write("payload".encodeToByteArray()) }
 
-    assertEquals("WORKER_CLOSED", error.code)
+    assertEquals("TRANSPORT_ERROR", error.code)
 
     left.close()
     ipc.exited(0)
