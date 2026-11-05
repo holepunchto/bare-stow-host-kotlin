@@ -154,9 +154,18 @@ public class Ipc(
    * Waits for the worker to signal ready.
    *
    * @throws WorkerError If the worker errors, exits, closes, or times out before then, in which
-   *   case the worker is terminated.
+   *   case the worker is terminated. The worker is also terminated if the caller is cancelled
+   *   before then.
    */
-  public suspend fun ready(): Unit = readied.await()
+  public suspend fun ready() {
+    try {
+      readied.await()
+    } catch (error: CancellationException) {
+      if (!readied.isCompleted) scope.launch { close() }
+
+      throw error
+    }
+  }
 
   /** Writes [data] to the worker as user data. */
   public suspend fun write(data: ByteArray) {
@@ -247,11 +256,17 @@ public class Ipc(
     }
 
     // A worker whose transport ends without it saying why has crashed, so the end is held back
-    // until its exit is reported for readers to fail with. It can no longer time out, as it
-    // already ended.
-    synchronized(lock) { closed = true }
+    // until its exit is reported for readers to fail with. So is the end of a worker that is
+    // already failing, until it has failed readers. It can no longer time out, as it already
+    // ended.
+    val holding =
+      synchronized(lock) {
+        closed = true
 
-    if (crashed()) {
+        failure != null || (!exitReported && !terminateSent)
+      }
+
+    if (holding) {
       synchronized(lock) { timer }?.cancel()
 
       failed.await()
@@ -301,9 +316,6 @@ public class Ipc(
         )
     }
   }
-
-  private fun crashed(): Boolean =
-    synchronized(lock) { !exitReported && !terminateSent && failure == null }
 
   private fun onClose() {
     settleReady(WorkerError("Worker closed before ready", code = "WORKER_CLOSED"))
