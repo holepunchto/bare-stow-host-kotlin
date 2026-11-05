@@ -293,6 +293,20 @@ class IpcTest {
   }
 
   @Test
+  fun terminatesTheWorkerWhenReadyIsCancelled() = test {
+    val (left, right) = pair()
+    val ipc = Ipc(left.data, left::write, kill = { left.close() })
+    val worker = Worker(right)
+
+    assertNull(withTimeoutOrNull(10.milliseconds) { ipc.ready() })
+
+    worker.receive("terminate")
+    worker.close()
+
+    assertReadyFails(ipc, "WORKER_CLOSED")
+  }
+
+  @Test
   fun terminateKillsTheWorkerAfterTheGracePeriod() = test {
     val (left, right) = pair()
     val ipc = Ipc(left.data, left::write, kill = { left.close() }, grace = 10.milliseconds)
